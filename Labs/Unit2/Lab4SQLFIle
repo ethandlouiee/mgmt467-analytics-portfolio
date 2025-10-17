@@ -1,0 +1,97 @@
+
+-- ====================================================================
+-- MGMT 467: Data Quality (DQ) Queries for Netflix Dataset
+-- ====================================================================
+
+-- 5.1 Missingness: Profile missing values in the users table
+-- This query calculates the total count and percentage of missing values
+-- for key demographic and subscription columns.
+WITH base_missingness AS (
+  SELECT
+    COUNT(*) AS n,
+    COUNTIF(country IS NULL) AS miss_country,
+    COUNTIF(subscription_plan IS NULL) AS miss_plan,
+    COUNTIF(age IS NULL) AS miss_age
+  FROM `noble-broker-471012-q6.netflix.users`
+)
+SELECT
+  n AS total_rows,
+  ROUND(100 * miss_country / n, 2) AS pct_missing_country,
+  ROUND(100 * miss_plan / n, 2) AS pct_missing_subscription_plan,
+  ROUND(100 * miss_age / n, 2) AS pct_missing_age
+FROM base_missingness;
+
+-- 5.2 Duplicates: Detect and remove duplicate watch history records
+-- This query identifies duplicate records based on a composite key.
+SELECT
+  user_id, movie_id, watch_date, device_type, COUNT(*) AS dup_count
+FROM `noble-broker-471012-q6.netflix.watch_history`
+GROUP BY 1, 2, 3, 4
+HAVING dup_count > 1
+ORDER BY dup_count DESC
+LIMIT 20;
+
+-- This query creates a new table with duplicates removed, keeping the most complete record.
+CREATE OR REPLACE TABLE `noble-broker-471012-q6.netflix.watch_history_dedup` AS
+SELECT * EXCEPT(rk) FROM (
+  SELECT
+    h.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_id, movie_id, watch_date, device_type
+      ORDER BY progress_percentage DESC, watch_duration_minutes DESC
+    ) AS rk
+  FROM `noble-broker-471012-q6.netflix.watch_history` h
+)
+WHERE rk = 1;
+
+-- 5.3 Outliers: Identify and cap extreme values in watch duration
+-- This query calculates outliers based on the 1.5*IQR rule.
+WITH dist AS (
+  SELECT
+    APPROX_QUANTILES(watch_duration_minutes, 4)[OFFSET(1)] AS q1,
+    APPROX_QUANTILES(watch_duration_minutes, 4)[OFFSET(3)] AS q3
+  FROM `noble-broker-471012-q6.netflix.watch_history_dedup`
+),
+bounds AS (
+  SELECT
+    (q3 - q1) AS iqr,
+    q1 - 1.5 * (q3 - q1) AS lo,
+    q3 + 1.5 * (q3 - q1) AS hi
+  FROM dist
+)
+SELECT
+  COUNTIF(h.watch_duration_minutes < b.lo OR h.watch_duration_minutes > b.hi) AS outliers,
+  ROUND(100 * COUNTIF(h.watch_duration_minutes < b.lo OR h.watch_duration_minutes > b.hi) / COUNT(*), 2) AS pct_outliers
+FROM `noble-broker-471012-q6.netflix.watch_history_dedup` h CROSS JOIN bounds b;
+
+-- This query creates a robust table by capping (Winsorizing) outliers at the 1st and 99th percentiles.
+CREATE OR REPLACE TABLE `noble-broker-471012-q6.netflix.watch_history_robust` AS
+WITH q AS (
+  SELECT
+    APPROX_QUANTILES(watch_duration_minutes, 100)[OFFSET(1)] AS p01,
+    APPROX_QUANTILES(watch_duration_minutes, 100)[OFFSET(99)] AS p99
+  FROM `noble-broker-471012-q6.netflix.watch_history_dedup`
+)
+SELECT
+  h.*,
+  GREATEST(q.p01, LEAST(q.p99, h.watch_duration_minutes)) AS watch_duration_minutes_capped
+FROM `noble-broker-471012-q6.netflix.watch_history_dedup` h, q;
+
+-- 5.4 Business Anomaly Flags
+-- Flag 1: Binge watching sessions (> 8 hours)
+SELECT
+  COUNTIF(watch_duration_minutes_capped > 8 * 60) AS sessions_over_8h,
+  ROUND(100 * COUNTIF(watch_duration_minutes_capped > 8 * 60) / COUNT(*), 2) AS pct
+FROM `noble-broker-471012-q6.netflix.watch_history_robust`;
+
+-- Flag 2: Extreme user ages (< 10 or > 100)
+SELECT
+  COUNTIF(age < 10 OR age > 100) AS extreme_age_rows,
+  ROUND(100 * COUNTIF(age < 10 OR age > 100) / COUNT(*), 2) AS pct
+FROM `noble-broker-471012-q6.netflix.users`;
+
+-- Flag 3: Anomalous movie durations (< 15 min or > 8 hours)
+SELECT
+  COUNTIF(duration_minutes < 15 OR duration_minutes > 480) AS anomaly_duration_titles,
+  ROUND(100 * COUNTIF(duration_minutes < 15 OR duration_minutes > 480) / COUNT(*), 2) AS pct_duration_anomaly
+FROM `noble-broker-471012-q6.netflix.movies`;
